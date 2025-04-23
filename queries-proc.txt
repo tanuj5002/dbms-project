@@ -1,0 +1,390 @@
+-----> waiting list count in a train <-----
+
+delimiter $$
+create procedure wlist(
+    in p_trainID int
+)
+begin
+select Train.TrainName as Train, count(Booking.TrainID) as WaitingList from Booking
+join Train on Train.TrainID = Booking.TrainID
+where BookingStatus = 'wl' and Booking.TrainID = p_trainID
+group by Train.TrainName;
+end$$
+delimiter ;
+
+-------> Total amount with railways <-------
+delimiter $$
+create procedure totalAmount()
+begin
+declare amountPaid_var int default 0;
+declare refundAmount_var int default 0;
+select ifnull(sum(AmountPaid), 0) into amountPaid_var from Payment
+where PaymentStatus = 'Success';
+select ifnull(sum(refundAmount), 0) into refundAmount_var from Payment
+where RefundStatus = 'Refunded';
+select amountPaid_var - refundAmount_var as TotalAmount;
+end$$
+delimiter ;
+
+-------> PNR tracking <-----
+delimiter $$
+create procedure track(
+    in pnr int
+)
+begin
+select 
+b.BookingID,
+b.PassengerID,
+(select TrainName from Train where b.TrainID = Train.TrainID) as Train,
+b.BookingDate,
+b.JourneyDate,
+(select StationName from station where stationID =  SourceStationID) as SourceStation,
+(select StationName from station where stationID =  DestinationStationID) as DestinationStation,
+concat(seatNumber, ' ', SeatType) as seat,
+b.bookingstatus as status
+from booking b 
+join seat s on s.seatID = b.seatID
+where b.BookingID = pnr;
+end$$
+delimiter ;
+
+------>cancel ticket <-----
+DELIMITER $$
+
+CREATE PROCEDURE cancel(IN p_BookingID INT)
+BEGIN
+    UPDATE Booking
+    SET 
+        BookingStatus = 'cancelled',
+        IsCancelled = 1,
+        CancelledDate = NOW()
+    WHERE BookingID = p_BookingID;
+END $$
+
+DELIMITER ;
+
+
+------->trigger for all associated tasks after cancel ticket <----
+DELIMITER $$
+
+CREATE TRIGGER after_booking_cancel
+AFTER UPDATE ON Booking
+FOR EACH ROW
+BEGIN
+    DECLARE v_SeatID INT;
+    DECLARE v_IsRefundable BOOLEAN;
+    DECLARE v_AmountPaid DECIMAL(10,2);
+
+    -- Only run if BookingStatus changed to 'cancelled'
+    IF NEW.BookingStatus = 'cancelled' AND OLD.BookingStatus != 'cancelled' THEN
+
+        -- Get seat ID
+        SET v_SeatID = NEW.SeatID;
+
+        -- Make seat available
+        UPDATE Seat
+        SET IsAvailable = 1
+        WHERE SeatID = v_SeatID;
+
+        -- Check if refundable & amount paid
+        SELECT IsRefundable, AmountPaid 
+        INTO v_IsRefundable, v_AmountPaid
+        FROM Payment
+        WHERE BookingID = NEW.BookingID;
+
+        -- Refund if applicable
+        IF v_IsRefundable = TRUE THEN
+            UPDATE Payment
+            SET 
+                RefundStatus = 'Refunded',
+                RefundAmount = v_AmountPaid,
+                RefundProcessedAt = NOW()
+            WHERE BookingID = NEW.BookingID;
+        END IF;
+
+        -- Update SeatAllocation
+        UPDATE SeatAllocation
+        SET 
+            BookingStatusID = 0,
+            LastUpdated = NOW()
+        WHERE BookingID = NEW.BookingID;
+    END IF;
+END $$
+
+DELIMITER ;
+
+----->schedule lookup for a particular train <----
+delimiter $$
+create procedure slookup(
+    in p_trainID int
+)
+begin
+select daysofoperation from schedule where trainid = p_trainID;
+select routeID, (select stationName from station s where s.stationID = r.stationID), ArrivalTime, DepartureTime, HaltTime from route r
+join train on train.trainID = r.trainID
+where r.trainID = p_trainID;
+end$$
+delimiter ;
+
+----->list all passengers travelling in a specific train on specific date<----
+
+delimiter $$
+create procedure passengerlist(
+    in p_trainid int,
+    in p_date date
+)
+begin
+select p.Name, p.age, p.gender from passenger p
+join booking b on b.passengerid = p.passengerid
+where b.JourneyDate = p_date and b.trainid = p_trainid;
+end$$
+delimiter ;
+
+---->bussiest route<----
+create view SDbooking
+select TrainID, concat(SourceStationID,DestinationStationID) as combined from Booking;
+
+select sum(combined) from SDbooking
+groupby combined
+limit 1;
+
+------>revenue generated for a specific period<-----
+delimiter $$
+create procedure revgen(
+    in stDate date,
+    in endDate date
+)
+begin
+declare amountPaid_var int default 0;
+declare refundAmount_var int default 0;
+select ifnull(sum(AmountPaid), 0) into amountPaid_var from Payment
+where PaymentStatus = 'Success' and paymentDate between stDate and endDate;
+
+select ifnull(sum(refundAmount), 0) into refundAmount_var from Payment
+where RefundStatus = 'Refunded' and RefundProcessedAt between stDate and endDate;
+select amountPaid_var - refundAmount_var as TotalAmount;
+end$$
+delimiter ;
+
+------>Ticket<----
+DELIMITER $$
+
+CREATE PROCEDURE BookTicket(
+    IN p_PassengerID INT,
+    IN p_TrainID INT,
+    IN p_ScheduleID INT,
+    IN p_JourneyDate DATE,
+    IN p_SourceStationID INT,
+    IN p_DestinationStationID INT,
+    IN p_ClassID INT,
+    IN p_QuotaType VARCHAR(50)
+)
+BEGIN
+    DECLARE v_CoachID INT;
+    DECLARE v_SeatID INT;
+    DECLARE v_SeatNumber VARCHAR(10);
+    DECLARE v_BookingID INT;
+    DECLARE v_SourceDistance INT;
+    DECLARE v_DestDistance INT;
+    DECLARE v_Distance INT;
+    DECLARE v_FarePerKm DECIMAL(5,2);
+    DECLARE v_BaseFare DECIMAL(10,2);
+    DECLARE v_TotalAmount DECIMAL(10,2);
+    DECLARE v_ConvenienceFee INT DEFAULT 50;
+    DECLARE v_PlatformFee INT DEFAULT 50;
+
+    -- Find available seat
+    SELECT s.SeatID, s.CoachID, s.SeatNumber
+    INTO v_SeatID, v_CoachID, v_SeatNumber
+    FROM Seat s
+    JOIN Coach c ON c.CoachID = s.CoachID
+    WHERE s.IsAvailable = TRUE
+      AND s.ClassID = p_ClassID
+      AND c.TrainID = p_TrainID
+    LIMIT 1;
+
+    -- Mark seat as unavailable
+    UPDATE Seat SET IsAvailable = FALSE WHERE SeatID = v_SeatID;
+
+    -- Generate BookingID
+    SELECT IFNULL(MAX(BookingID), 0) + 1 INTO v_BookingID FROM Booking;
+
+    -- Insert into Booking
+    INSERT INTO Booking (
+        BookingID, PassengerID, TrainID, ScheduleID,
+        BookingDate, JourneyDate, SourceStationID,
+        DestinationStationID, ClassID, CoachID, SeatID,
+        BookingStatus, QuotaType, IsCancelled,
+        CancelledDate, RefundAmount
+    )
+    VALUES (
+        v_BookingID, p_PassengerID, p_TrainID, p_ScheduleID,
+        NOW(), p_JourneyDate, p_SourceStationID,
+        p_DestinationStationID, p_ClassID, v_CoachID, v_SeatID,
+        'wl', p_QuotaType, FALSE,
+        NULL, NULL
+    );
+
+    -- Get distance
+    SELECT ifnull(DistanceFromSource, 0) INTO v_SourceDistance
+    FROM Route
+    WHERE StationID = p_SourceStationID AND TrainID = p_TrainID;
+
+    SELECT ifnull(DistanceFromSource,0) INTO v_DestDistance
+    FROM Route
+    WHERE StationID = p_DestinationStationID AND TrainID = p_TrainID;
+
+    SET v_Distance = ABS(v_DestDistance - v_SourceDistance);
+
+    -- Get fare rate
+    SELECT FarePerKm INTO v_FarePerKm FROM Class WHERE ClassID = p_ClassID;
+
+    -- Calculate fares
+    SET v_BaseFare = v_Distance * v_FarePerKm;
+    SET v_TotalAmount = v_BaseFare + v_ConvenienceFee + v_PlatformFee;
+
+    -- Show itemized bill
+    SELECT 
+        v_BookingID AS 'Booking ID',
+        p_PassengerID AS 'Passenger ID',
+        p_TrainID AS 'Train ID',
+        p_ClassID AS 'Class ID',
+        v_Distance AS 'Distance (km)',
+        v_BaseFare AS 'Base Fare',
+        v_ConvenienceFee AS 'Convenience Fee',
+        v_PlatformFee AS 'Platform Fee',
+        v_TotalAmount AS 'Total Fare';
+END$$
+
+DELIMITER ;
+
+----->available seats train,date,class<-----
+delimiter $$
+create procedure availseats(
+    in p_trainid int,
+    in p_date date,
+    in p_class int
+)
+begin
+declare totalseats int;
+declare bookedseats int;
+select ifnull(count(*), 0) into totalseats from seat s 
+join coach c on c.CoachID = s.CoachID
+where c.classID = p_class;
+
+select ifnull(count(*),0) into bookedseats from booking
+where booking.trainid = p_trainid and booking.JourneyDate = p_date;
+
+select (select trainName from train where train.trainid = p_trainID) as Train,p_date as Date, (totalseats - bookedseats) as SeatsAvailable;
+end$$
+delimiter ;
+
+
+----->list of wailist passengers in a train<----
+
+delimiter $$
+create procedure listwl(
+    in p_trainid int,
+    in p_date date
+)
+begin
+select p.name, p.age, p.gender from passenger p
+join booking b on b.passengerid = p.passengerid
+where trainid = p_trainid and JourneyDate = p_date and BookingStatus = 'wl';
+end$$
+delimiter ;
+
+------->payment<-----
+DELIMITER $$
+
+CREATE DEFINER=`root`@`localhost` PROCEDURE `MakePayment`(
+    IN p_PaymentID INT,
+    IN p_BookingID INT,
+    IN p_PaymentDate DATETIME,
+    IN p_PaymentTime TIME,
+    IN p_AmountPaid DECIMAL(10,2),
+    IN p_PaymentMethod VARCHAR(30),
+    IN p_PaymentGateway VARCHAR(30),
+    IN p_TransactionID VARCHAR(40),
+    IN p_PaymentStatus ENUM('Success','Failed','Pending','Cancelled'),
+    IN p_IsRefundable BOOLEAN,
+    IN p_RefundStatus ENUM('Not Initiated','In process','Refunded','Rejected'),
+    IN p_RefundAmount DECIMAL(10,2),
+    IN p_RefundProcessedAt DATETIME
+)
+BEGIN
+    -- Insert the payment record
+    INSERT INTO Payment (
+        PaymentID, BookingID, PaymentDate, PaymentTime,
+        AmountPaid, PaymentMethod, PaymentGateway, TransactionID,
+        PaymentStatus, IsRefundable, RefundStatus, RefundAmount, RefundProcessedAt
+    )
+    VALUES (
+        p_PaymentID, p_BookingID, p_PaymentDate, p_PaymentTime,
+        p_AmountPaid, p_PaymentMethod, p_PaymentGateway, p_TransactionID,
+        p_PaymentStatus, p_IsRefundable, p_RefundStatus, p_RefundAmount, p_RefundProcessedAt
+    );
+
+    -- If payment was successful, confirm the booking
+    IF p_PaymentStatus = 'Success' THEN
+        UPDATE Booking
+        SET BookingStatus = 'cnf'
+        WHERE BookingID = p_BookingID;
+    END IF;
+
+    -- If payment was cancelled or failed and is refundable, cancel the booking and store refund info
+    IF (p_PaymentStatus = 'Cancelled' OR p_PaymentStatus = 'Failed') AND p_IsRefundable = TRUE THEN
+        UPDATE Booking
+        SET
+            IsCancelled = TRUE,
+            CancelledDate = NOW(),
+            RefundAmount = p_RefundAmount
+        WHERE BookingID = p_BookingID;
+    END IF;
+END$$
+
+DELIMITER ;
+
+------>payment trigger<-----
+
+DELIMITER $$
+
+CREATE TRIGGER after_booking_insert
+AFTER INSERT ON Booking
+FOR EACH ROW
+BEGIN
+    DECLARE v_AllocationID INT;
+
+    -- 1. Generate next AllocationID
+    SELECT IFNULL(MAX(AllocationID), 0) + 1
+    INTO v_AllocationID
+    FROM SeatAllocation;
+
+    -- 2. Insert into SeatAllocation using data from NEW Booking row
+    INSERT INTO SeatAllocation (
+        AllocationID, TrainID, ScheduleID, JourneyDate,
+        CoachID, SeatID, SeatNumber, PassengerID,
+        BookingID, ClassID, BookingStatusID,
+        AllocationTime, LastUpdated
+    )
+    SELECT
+        v_AllocationID, t.TrainID, t.ScheduleID, t.JourneyDate,
+        t.CoachID, t.SeatID, s.SeatNumber, t.PassengerID,
+        t.BookingID, t.ClassID, 1,
+        NOW(), NOW()
+    FROM (
+        SELECT
+            NEW.TrainID AS TrainID,
+            NEW.ScheduleID AS ScheduleID,
+            NEW.JourneyDate AS JourneyDate,
+            NEW.CoachID AS CoachID,
+            NEW.SeatID AS SeatID,
+            NEW.PassengerID AS PassengerID,
+            NEW.BookingID AS BookingID,
+            NEW.ClassID AS ClassID
+    ) t
+    JOIN Seat s ON s.SeatID = t.SeatID;
+END$$
+
+DELIMITER ;
+
